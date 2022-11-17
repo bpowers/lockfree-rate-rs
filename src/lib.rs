@@ -134,8 +134,8 @@ impl LimiterState {
     /// advance requires that lim.mu is held.
     fn advance(&self, now: Instant) -> f64 {
         let mut last = self.last;
-        // if there is a monotonicity bug, pull last forward
-        if now.checked_duration_since(last).is_none() {
+        // if there is a monotonicity bug, pull last backward
+        if now < last {
             last = now;
         }
 
