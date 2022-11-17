@@ -76,8 +76,11 @@ impl Limiter {
             return ok;
         }
 
-        let mut tokens = inner.advance(now);
+        let (last, mut tokens) = inner.advance(now);
         if tokens < (n as f64) {
+            if last != inner.last {
+                inner.last = last;
+            }
             return false;
         }
 
@@ -105,7 +108,8 @@ impl Limiter {
 
     pub fn tokens_at(&self, now: Instant) -> f64 {
         let inner = self.inner.lock().unwrap();
-        inner.advance(now)
+        let (_, toks) = inner.advance(now);
+        toks
     }
 }
 
@@ -130,9 +134,7 @@ fn tokens_from_duration(limit: Limit, d: Duration) -> f64 {
 
 impl LimiterState {
     /// advance calculates and returns an updated state for lim resulting from the passage of time.
-    /// lim is not changed.
-    /// advance requires that lim.mu is held.
-    fn advance(&self, now: Instant) -> f64 {
+    fn advance(&self, now: Instant) -> (Instant, f64) {
         let mut last = self.last;
         // if there is a monotonicity bug, pull last backward
         if now < last {
@@ -146,7 +148,7 @@ impl LimiterState {
         if tokens > (self.burst as f64) {
             tokens = self.burst as f64;
         }
-        tokens
+        (last, tokens)
     }
 }
 
