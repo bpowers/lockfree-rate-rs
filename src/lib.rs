@@ -326,3 +326,32 @@ fn test_limiter_burst_3() {
         ],
     )
 }
+
+#[test]
+fn test_limiter_burst_jump_backwards() {
+    run(
+        &Limiter::new(10.0, 3),
+        &vec![
+		req(T.t1, 3., 1, true), // start at t1
+		req(T.t0, 2., 1, true), // jump back to t0, two tokens remain
+		req(T.t0, 1., 1, true),
+		req(T.t0, 0., 1, false),
+		req(T.t0, 0., 1, false),
+		req(T.t1, 1., 1, true), // got a token
+		req(T.t1, 0., 1, false),
+		req(T.t1, 0., 1, false),
+		req(T.t2, 1., 1, true), // got another token
+		req(T.t2, 0., 1, false),
+		req(T.t2, 0., 1, false),
+        ],
+    )
+}
+
+// Ensure that tokensFromDuration doesn't produce
+// rounding errors by truncating nanoseconds.
+// See golang.org/issues/34861.
+#[test]
+fn test_limiter_no_truncation_erors() {
+    let l = Limiter::new(0.7692307692307693, 1);
+    assert!(l.allow());
+}
