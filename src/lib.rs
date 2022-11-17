@@ -282,65 +282,47 @@ fn run(lim: &Limiter, allows: &[Allow]) {
     }
 }
 
+#[cfg(test)]
+fn req(t: Instant, toks: f64, n: u32, ok: bool) -> Allow {
+    Allow { t, toks, n, ok }
+}
+
 #[test]
 fn test_limiter_burst_1() {
     run(
         &Limiter::new(10.0, 1),
         &vec![
-            Allow {
-                t: T.t0,
-                toks: 1.0,
-                n: 1,
-                ok: true,
-            },
-            Allow {
-                t: T.t0,
-                toks: 0.0,
-                n: 1,
-                ok: false,
-            },
-            Allow {
-                t: T.t0,
-                toks: 0.0,
-                n: 1,
-                ok: false,
-            },
-            Allow {
-                t: T.t1,
-                toks: 1.0,
-                n: 1,
-                ok: true,
-            },
-            Allow {
-                t: T.t1,
-                toks: 0.0,
-                n: 1,
-                ok: false,
-            },
-            Allow {
-                t: T.t1,
-                toks: 0.0,
-                n: 1,
-                ok: false,
-            },
-            Allow {
-                t: T.t2,
-                toks: 1.0,
-                n: 2, // burst size is 1, so n=2 always fails
-                ok: false,
-            },
-            Allow {
-                t: T.t2,
-                toks: 1.0,
-                n: 1,
-                ok: true,
-            },
-            Allow {
-                t: T.t2,
-                toks: 0.0,
-                n: 1,
-                ok: false,
-            },
+            req(T.t0, 1., 1, true),
+            req(T.t0, 0., 1, false),
+            req(T.t0, 0., 1, false),
+            req(T.t1, 1., 1, true),
+            req(T.t1, 0., 1, false),
+            req(T.t1, 0., 1, false),
+            req(T.t2, 1., 2, false), // burst size is 1, so n=2 always fails
+            req(T.t2, 1., 1, true),
+            req(T.t2, 0., 1, false),
+        ],
+    )
+}
+
+#[test]
+fn test_limiter_burst_3() {
+    run(
+        &Limiter::new(10.0, 3),
+        &vec![
+            req(T.t0, 3., 2, true),
+            req(T.t0, 1., 2, false),
+            req(T.t0, 1., 1, true),
+            req(T.t0, 0., 1, false),
+            req(T.t1, 1., 4, false),
+            req(T.t2, 2., 1, true),
+            req(T.t3, 2., 1, true),
+            req(T.t4, 2., 1, true),
+            req(T.t4, 1., 1, true),
+            req(T.t4, 0., 1, false),
+            req(T.t4, 0., 1, false),
+            req(T.t9, 3., 3, true),
+            req(T.t9, 0., 1, false), // different from Go testcase: we don't allow 0 token requests
         ],
     )
 }
