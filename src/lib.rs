@@ -98,6 +98,15 @@ impl Limiter {
         let inner = self.inner.lock().unwrap();
         inner.limit
     }
+
+    pub fn tokens(&self) -> f64 {
+        self.tokens_at(Instant::now())
+    }
+
+    pub fn tokens_at(&self, now: Instant) -> f64 {
+        let inner = self.inner.lock().unwrap();
+        inner.advance(now)
+    }
 }
 
 /// duration_from_tokens is a unit conversion function from the number of tokens to the duration
@@ -124,11 +133,11 @@ impl LimiterState {
     /// lim is not changed.
     /// advance requires that lim.mu is held.
     fn advance(&self, now: Instant) -> f64 {
-        let last = self.last;
-        // TODO: in rust, this condition can never happen as we only use the monotonic clock
-        // if now.Before(last) {
-        //     last = now
-        // }
+        let mut last = self.last;
+        // if there is a monotonicity bug, pull last forward
+        if now.checked_duration_since(last).is_none() {
+            last = now;
+        }
 
         // Calculate the new number of tokens, due to time that passed.
         let elapsed = now.duration_since(last);
@@ -215,4 +224,121 @@ fn test_every() {
             tc.lim
         );
     }
+}
+
+#[cfg(test)]
+const D: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+struct Times {
+    t0: Instant,
+    t1: Instant,
+    t2: Instant,
+    t3: Instant,
+    t4: Instant,
+    t5: Instant,
+    t9: Instant,
+}
+
+#[cfg(test)]
+static T: once_cell::sync::Lazy<Times> = once_cell::sync::Lazy::new(|| {
+    let t0 = Instant::now();
+    Times {
+        t0,
+        t1: t0 + (1 * D),
+        t2: t0 + (2 * D),
+        t3: t0 + (3 * D),
+        t4: t0 + (4 * D),
+        t5: t0 + (5 * D),
+        t9: t0 + (9 * D),
+    }
+});
+
+#[cfg(test)]
+struct Allow {
+    t: Instant,
+    toks: f64,
+    n: u32,
+    ok: bool,
+}
+
+#[cfg(test)]
+fn run(lim: &Limiter, allows: &[Allow]) {
+    for (i, allow) in allows.iter().enumerate() {
+        let toks = lim.tokens_at(allow.t);
+        assert_eq!(
+            allow.toks, toks,
+            "step {}: lim.tokens_at({:?}) = {} want {}",
+            i, allow.t, toks, allow.toks
+        );
+        let ok = lim.reserve_n(allow.t, NonZeroU32::new(allow.n).unwrap());
+        assert_eq!(
+            allow.ok, ok,
+            "step {}: lim.AllowN({:?}, {}) = {} want {}",
+            i, allow.t, allow.n, ok, allow.ok
+        );
+    }
+}
+
+#[test]
+fn test_limiter_burst_1() {
+    run(
+        &Limiter::new(10.0, 1),
+        &vec![
+            Allow {
+                t: T.t0,
+                toks: 1.0,
+                n: 1,
+                ok: true,
+            },
+            Allow {
+                t: T.t0,
+                toks: 0.0,
+                n: 1,
+                ok: false,
+            },
+            Allow {
+                t: T.t0,
+                toks: 0.0,
+                n: 1,
+                ok: false,
+            },
+            Allow {
+                t: T.t1,
+                toks: 1.0,
+                n: 1,
+                ok: true,
+            },
+            Allow {
+                t: T.t1,
+                toks: 0.0,
+                n: 1,
+                ok: false,
+            },
+            Allow {
+                t: T.t1,
+                toks: 0.0,
+                n: 1,
+                ok: false,
+            },
+            Allow {
+                t: T.t2,
+                toks: 1.0,
+                n: 2, // burst size is 1, so n=2 always fails
+                ok: false,
+            },
+            Allow {
+                t: T.t2,
+                toks: 1.0,
+                n: 1,
+                ok: true,
+            },
+            Allow {
+                t: T.t2,
+                toks: 0.0,
+                n: 1,
+                ok: false,
+            },
+        ],
+    )
 }
