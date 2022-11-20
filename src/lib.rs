@@ -2,8 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+use std::error::Error;
+use std::io;
 use std::num::NonZeroU32;
-use std::sync::Mutex;
+use std::sync::{atomic, Mutex};
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::time::{Duration, Instant};
 
 /// Limit defines the maximum frequency of some events.
@@ -25,31 +28,131 @@ pub fn every(interval: Duration) -> Limit {
     1f64 / interval.as_secs_f64()
 }
 
-pub struct Limiter {
-    inner: Mutex<LimiterState>,
+const TIME_SHIFT: u64 = 20;
+const SENTINEL_SHIFT: u64 = TIME_SHIFT - 1;
+const CATCH_UNDERFLOW_SHIFT: u64 = SENTINEL_SHIFT - 1;
+const TOKENS_MASK: u64 = (1 << CATCH_UNDERFLOW_SHIFT) - 1;
+const MAX_TOKENS: u64 = (1 << (CATCH_UNDERFLOW_SHIFT - 1)) - 1;
+
+// max_tries is the number of CAS loops we will go through below, and is low-ish
+// to ensure we don't live-lock in some pathological scenario.  See the loop in
+// reserve below for more color on why this is a fine limit.
+const MAX_TRIES: u64 = 256;
+
+// PackedState conceptually fits both "last updated" and "tokens remaining" into
+// a single 64-bit value that can be read and set atomically.  The packed state
+// looks like:
+//
+//	              1 bit: always-1 underflow catch -
+//	                   1 bit: always-1 sentinel -  |
+//	44-bits: microsecond-resolution duration     | | 18-bits: signed token count
+//	____________________________________________ _ _ __________________
+//
+// The "clever" part is that we always initialize 2 bits to 1 in between the packed
+// values. Immediately adjacent to the token count is a bit set to 1 ("underflow
+// catch" in the diagram above).  If token count was 0 (all 18-bits are zero) and we
+// decrement it (like happens in the first conditional in the loop below), the
+// underflow catch bit will be distributed right and all 18-bits will now be 1 (-1
+// in twos-compliment).  This ensures that race-y decrement is safe and doesn't impact
+// the stored duration.  We keep an extra "sentinel" value between the underflow catch
+// bit and the duration to ensure that we can tell if state has been initialized, and
+// as a backstop in case the non-conditional decrements go wrong in some unknown way.
+struct PackedStateCell {
+    inner: AtomicU64,
 }
 
-pub struct LimiterState {
+type PackedState = u64;
+
+#[derive(Copy, Clone)]
+struct UnpackedState {
+    time_diff_micros: u64,
+    tokens: i32,
+}
+
+impl UnpackedState {
+    fn new(mut time_diff_micros: u64, mut tokens: i32) -> Self {
+        if time_diff_micros < 0 {
+            time_diff_micros = 0
+        }
+        if tokens < 0 {
+            tokens = 0
+        }
+
+        Self {
+            time_diff_micros,
+            tokens,
+        }
+    }
+}
+
+impl Into<PackedState> for UnpackedState {
+    fn into(self) -> PackedState {
+        	(self.time_diff_micros << TIME_SHIFT) | (0x1 << SENTINEL_SHIFT) | (0x1 << CATCH_UNDERFLOW_SHIFT) | ((self.tokens as u64) & TOKENS_MASK)
+    }
+}
+
+impl TryFrom<PackedState> for UnpackedState {
+    type Error = io::Error;
+    fn try_from(ps: PackedState) -> Result<Self, Self::Error> {
+        let tokens = {
+            let tokens = (ps & TOKENS_MASK) as i32;
+
+            // this ensures that negative values are properly represented in our widening
+            // from 18 to 32 bits. Check out TestUnderflow for details.
+            (tokens << (32 - CATCH_UNDERFLOW_SHIFT)) >> (32 - CATCH_UNDERFLOW_SHIFT)
+        };
+
+        let time_diff_micros = 	ps >> TIME_SHIFT;
+
+        let ok = 	 ((ps >> SENTINEL_SHIFT) & 0x1) == 0x1;
+        if !ok {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "packed data corrupted"))
+        }
+
+        Ok(Self {
+            time_diff_micros,
+            tokens,
+        })
+    }
+}
+
+// newPackedState packs a microsecond-resolution time duration along with a token
+// count into a single 32-bit value.
+fn new_packed_state(mut time_diff_micros: u64, mut tokens: i32) -> PackedState {
+	if time_diff_micros < 0 {
+		time_diff_micros = 0
+	}
+    if tokens < 0 {
+        tokens = 0
+    }
+	(time_diff_micros << TIME_SHIFT) | (0x1 << SENTINEL_SHIFT) | (0x1 << CATCH_UNDERFLOW_SHIFT) | ((tokens as u64) & TOKENS_MASK)
+}
+
+pub struct Limiter {
     limit: Limit,
-    burst: u64,
-    tokens: f64,
-    /// last is the last time the limiter's tokens field was updated
-    last: Instant,
+    base_write_mu: Mutex<()>,
+    base_micros: AtomicU64,
+    burst: AtomicI64,
+    state: AtomicU64,
 }
 
 impl Limiter {
     pub fn new(rate: Limit, burst: u32) -> Limiter {
         let now = Instant::now();
-        let inner = LimiterState {
+
+        let lim = Limiter {
             limit: rate,
-            burst: burst as u64,
-            tokens: burst as f64,
-            last: now,
+            base_write_mu: Mutex::new(()),
+            base_micros: 0.into(),
+            burst: burst.into(),
+            state: 0.into(),
         };
 
-        Limiter {
-            inner: Mutex::new(inner),
-        }
+        lim.reinit(Instant::now())
+    }
+
+    fn reinit(now: Instant) {
+
     }
 
     pub fn allow(&self) -> bool {
