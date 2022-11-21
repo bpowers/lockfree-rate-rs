@@ -2,11 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-use std::error::Error;
 use std::io;
 use std::num::NonZeroU32;
-use std::sync::{atomic, Mutex};
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Limit defines the maximum frequency of some events.
@@ -57,8 +56,17 @@ const MAX_TRIES: u64 = 256;
 // the stored duration.  We keep an extra "sentinel" value between the underflow catch
 // bit and the duration to ensure that we can tell if state has been initialized, and
 // as a backstop in case the non-conditional decrements go wrong in some unknown way.
+#[derive(Clone, Default)]
 struct PackedStateCell {
     inner: AtomicU64,
+}
+
+impl PackedStateCell {
+    fn load(&self) -> Result<UnpackedState, io::Error> {
+        let state: PackedState = self.inner.load(Ordering::SeqCst);
+
+        state.try_into()
+    }
 }
 
 type PackedState = u64;
@@ -86,8 +94,13 @@ impl UnpackedState {
 }
 
 impl Into<PackedState> for UnpackedState {
+    /// into packs a microsecond-resolution time duration along with a token
+    /// count into a single 64-bit value.
     fn into(self) -> PackedState {
-        	(self.time_diff_micros << TIME_SHIFT) | (0x1 << SENTINEL_SHIFT) | (0x1 << CATCH_UNDERFLOW_SHIFT) | ((self.tokens as u64) & TOKENS_MASK)
+        (self.time_diff_micros << TIME_SHIFT)
+            | (0x1 << SENTINEL_SHIFT)
+            | (0x1 << CATCH_UNDERFLOW_SHIFT)
+            | ((self.tokens as u64) & TOKENS_MASK)
     }
 }
 
@@ -102,11 +115,14 @@ impl TryFrom<PackedState> for UnpackedState {
             (tokens << (32 - CATCH_UNDERFLOW_SHIFT)) >> (32 - CATCH_UNDERFLOW_SHIFT)
         };
 
-        let time_diff_micros = 	ps >> TIME_SHIFT;
+        let time_diff_micros = ps >> TIME_SHIFT;
 
-        let ok = 	 ((ps >> SENTINEL_SHIFT) & 0x1) == 0x1;
+        let ok = ((ps >> SENTINEL_SHIFT) & 0x1) == 0x1;
         if !ok {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "packed data corrupted"))
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packed data corrupted",
+            ));
         }
 
         Ok(Self {
@@ -119,21 +135,25 @@ impl TryFrom<PackedState> for UnpackedState {
 // newPackedState packs a microsecond-resolution time duration along with a token
 // count into a single 32-bit value.
 fn new_packed_state(mut time_diff_micros: u64, mut tokens: i32) -> PackedState {
-	if time_diff_micros < 0 {
-		time_diff_micros = 0
-	}
+    if time_diff_micros < 0 {
+        time_diff_micros = 0
+    }
     if tokens < 0 {
         tokens = 0
     }
-	(time_diff_micros << TIME_SHIFT) | (0x1 << SENTINEL_SHIFT) | (0x1 << CATCH_UNDERFLOW_SHIFT) | ((tokens as u64) & TOKENS_MASK)
+    (time_diff_micros << TIME_SHIFT)
+        | (0x1 << SENTINEL_SHIFT)
+        | (0x1 << CATCH_UNDERFLOW_SHIFT)
+        | ((tokens as u64) & TOKENS_MASK)
 }
 
+#[derive(Default)]
 pub struct Limiter {
     limit: Limit,
-    base_write_mu: Mutex<()>,
-    base_micros: AtomicU64,
+    base: Instant,
+    reinit_mu: Mutex<()>,
     burst: AtomicI64,
-    state: AtomicU64,
+    state: PackedStateCell,
 }
 
 impl Limiter {
@@ -142,17 +162,23 @@ impl Limiter {
 
         let lim = Limiter {
             limit: rate,
-            base_write_mu: Mutex::new(()),
-            base_micros: 0.into(),
-            burst: burst.into(),
-            state: 0.into(),
+            burst: AtomicI64::from(burst as i64),
+            base: now,
+            ..Default::default()
         };
 
-        lim.reinit(Instant::now())
+        lim.reinit(now);
+
+        lim
     }
 
-    fn reinit(now: Instant) {
+    fn reinit(&self, now: Instant) {
+        #[allow(unused)]
+        let l = self.reinit_mu.lock().unwrap();
 
+        if let Err(_) = self.state.load() {
+            // store new packed state
+        }
     }
 
     pub fn allow(&self) -> bool {
@@ -196,13 +222,16 @@ impl Limiter {
     }
 
     pub fn burst(&self) -> u64 {
-        let inner = self.inner.lock().unwrap();
-        inner.burst
+        let n = self.burst.load(Ordering::SeqCst);
+        if n < 0 {
+            0
+        } else {
+            n as u64
+        }
     }
 
     pub fn limit(&self) -> Limit {
-        let inner = self.inner.lock().unwrap();
-        inner.limit
+        self.limit
     }
 
     pub fn tokens(&self) -> f64 {
@@ -235,24 +264,27 @@ fn tokens_from_duration(limit: Limit, d: Duration) -> f64 {
     d.as_secs_f64() * limit
 }
 
-impl LimiterState {
-    /// advance calculates and returns an updated state for lim resulting from the passage of time.
-    fn advance(&self, now: Instant) -> (Instant, f64) {
-        let mut last = self.last;
-        // if there is a monotonicity bug, pull last backward
-        if now < last {
-            last = now;
-        }
-
-        // Calculate the new number of tokens, due to time that passed.
-        let elapsed = now.duration_since(last);
-        let delta = tokens_from_duration(self.limit, elapsed);
-        let mut tokens = self.tokens + delta;
-        if tokens > (self.burst as f64) {
-            tokens = self.burst as f64;
-        }
-        (last, tokens)
+/// advance calculates and returns an updated state for lim resulting from the passage of time.
+fn advance(
+    lim: Limit,
+    now: Instant,
+    mut last: Instant,
+    old_tokens: i32,
+    burst: u32,
+) -> (Instant, f64) {
+    // if there is a monotonicity bug, pull last backward
+    if now < last {
+        last = now;
     }
+
+    // Calculate the new number of tokens, due to time that passed.
+    let elapsed = now.duration_since(last);
+    let delta = tokens_from_duration(lim, elapsed);
+    let mut tokens = (old_tokens as f64) + delta;
+    if tokens > (burst as f64) {
+        tokens = burst as f64;
+    }
+    (last, tokens)
 }
 
 #[cfg(test)]
@@ -435,17 +467,17 @@ fn test_limiter_burst_jump_backwards() {
     run(
         &Limiter::new(10.0, 3),
         &vec![
-		req(T.t1, 3., 1, true), // start at t1
-		req(T.t0, 2., 1, true), // jump back to t0, two tokens remain
-		req(T.t0, 1., 1, true),
-		req(T.t0, 0., 1, false),
-		req(T.t0, 0., 1, false),
-		req(T.t1, 1., 1, true), // got a token
-		req(T.t1, 0., 1, false),
-		req(T.t1, 0., 1, false),
-		req(T.t2, 1., 1, true), // got another token
-		req(T.t2, 0., 1, false),
-		req(T.t2, 0., 1, false),
+            req(T.t1, 3., 1, true), // start at t1
+            req(T.t0, 2., 1, true), // jump back to t0, two tokens remain
+            req(T.t0, 1., 1, true),
+            req(T.t0, 0., 1, false),
+            req(T.t0, 0., 1, false),
+            req(T.t1, 1., 1, true), // got a token
+            req(T.t1, 0., 1, false),
+            req(T.t1, 0., 1, false),
+            req(T.t2, 1., 1, true), // got another token
+            req(T.t2, 0., 1, false),
+            req(T.t2, 0., 1, false),
         ],
     )
 }
