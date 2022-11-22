@@ -56,7 +56,7 @@ const MAX_TRIES: u64 = 256;
 // the stored duration.  We keep an extra "sentinel" value between the underflow catch
 // bit and the duration to ensure that we can tell if state has been initialized, and
 // as a backstop in case the non-conditional decrements go wrong in some unknown way.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct PackedStateCell {
     inner: AtomicU64,
 }
@@ -147,7 +147,6 @@ fn new_packed_state(mut time_diff_micros: u64, mut tokens: i32) -> PackedState {
         | ((tokens as u64) & TOKENS_MASK)
 }
 
-#[derive(Default)]
 pub struct Limiter {
     limit: Limit,
     base: Instant,
@@ -162,9 +161,10 @@ impl Limiter {
 
         let lim = Limiter {
             limit: rate,
-            burst: AtomicI64::from(burst as i64),
             base: now,
-            ..Default::default()
+            reinit_mu: Mutex::new(()),
+            burst: AtomicI64::from(burst as i64),
+            state: PackedStateCell::default(),
         };
 
         lim.reinit(now);
@@ -192,31 +192,31 @@ impl Limiter {
     fn reserve_n(&self, now: Instant, n: NonZeroU32) -> bool {
         let n = n.get() as u64;
 
-        let mut inner = self.inner.lock().unwrap();
-
-        if inner.limit == INF {
-            return true;
-        } else if inner.limit == 0.0 {
-            let mut ok = false;
-            if inner.burst >= n {
-                inner.burst -= n;
-                ok = true;
-            }
-            return ok;
-        }
-
-        let (last, mut tokens) = inner.advance(now);
-        if tokens < (n as f64) {
-            if last != inner.last {
-                inner.last = last;
-            }
-            return false;
-        }
-
-        tokens -= n as f64;
-
-        inner.last = now;
-        inner.tokens = tokens;
+        // let mut inner = self.inner.lock().unwrap();
+        //
+        // if inner.limit == INF {
+        //     return true;
+        // } else if inner.limit == 0.0 {
+        //     let mut ok = false;
+        //     if inner.burst >= n {
+        //         inner.burst -= n;
+        //         ok = true;
+        //     }
+        //     return ok;
+        // }
+        //
+        // let (last, mut tokens) = inner.advance(now);
+        // if tokens < (n as f64) {
+        //     if last != inner.last {
+        //         inner.last = last;
+        //     }
+        //     return false;
+        // }
+        //
+        // tokens -= n as f64;
+        //
+        // inner.last = now;
+        // inner.tokens = tokens;
 
         true
     }
@@ -239,9 +239,10 @@ impl Limiter {
     }
 
     pub fn tokens_at(&self, now: Instant) -> f64 {
-        let inner = self.inner.lock().unwrap();
-        let (_, toks) = inner.advance(now);
-        toks
+        // let inner = self.inner.lock().unwrap();
+        // let (_, toks) = inner.advance(now);
+        // toks
+        0.0
     }
 }
 
