@@ -64,7 +64,7 @@ struct PackedStateCell {
 
 impl PackedStateCell {
     fn load(&self) -> Result<UnpackedState, io::Error> {
-        let state: PackedState = self.inner.load(Ordering::Acquire);
+        let state: PackedState = self.inner.load(Ordering::SeqCst);
 
         state.try_into()
     }
@@ -72,7 +72,7 @@ impl PackedStateCell {
     fn store(&self, state: UnpackedState) {
         let packed_state = state.into();
 
-        self.inner.store(packed_state, Ordering::Release)
+        self.inner.store(packed_state, Ordering::SeqCst)
     }
 
     fn compare_exchange(&self, prev: UnpackedState, next: UnpackedState) -> bool {
@@ -83,8 +83,8 @@ impl PackedStateCell {
             .compare_exchange(
                 prev_packed,
                 next_packed,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             )
             .is_ok()
     }
@@ -95,7 +95,7 @@ impl PackedStateCell {
     }
 
     fn dec(&self) -> Result<UnpackedState, io::Error> {
-        let new_state: PackedState = self.inner.fetch_add(!0, Ordering::Release) - 1;
+        let new_state: PackedState = self.inner.fetch_add(!0, Ordering::SeqCst) - 1;
 
         new_state.try_into()
     }
@@ -243,8 +243,8 @@ impl Limiter {
             return true;
         } else if self.limit == 0.0 {
             let mut ok = false;
-            if self.burst.load(Ordering::Acquire) >= n as i64 {
-                let prev_burst = self.burst.fetch_sub(n as i64, Ordering::Release);
+            if self.burst.load(Ordering::SeqCst) >= n as i64 {
+                let prev_burst = self.burst.fetch_sub(n as i64, Ordering::SeqCst);
                 ok = (prev_burst - n as i64) >= 0;
             }
             return ok;
@@ -302,7 +302,7 @@ impl Limiter {
                 now,
                 last,
                 curr_state.tokens,
-                self.burst.load(Ordering::Relaxed) as u32,
+                self.burst.load(Ordering::SeqCst) as u32,
             );
             if tokens < n as f64 {
                 // if there are no tokens available, return
