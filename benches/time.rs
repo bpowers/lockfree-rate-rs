@@ -1,5 +1,5 @@
-use std::time::{Instant, SystemTime};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::time::{Instant, SystemTime};
 
 fn instant() -> Instant {
     Instant::now()
@@ -16,4 +16,3 @@ fn get_time_benchmark(c: &mut Criterion) {
 
 criterion_group!(benches, get_time_benchmark);
 criterion_main!(benches);
-

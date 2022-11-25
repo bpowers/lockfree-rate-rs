@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+use std::cmp::max;
 use std::io;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -63,9 +64,40 @@ struct PackedStateCell {
 
 impl PackedStateCell {
     fn load(&self) -> Result<UnpackedState, io::Error> {
-        let state: PackedState = self.inner.load(Ordering::SeqCst);
+        let state: PackedState = self.inner.load(Ordering::Acquire);
 
         state.try_into()
+    }
+
+    fn store(&self, state: UnpackedState) {
+        let packed_state = state.into();
+
+        self.inner.store(packed_state, Ordering::Release)
+    }
+
+    fn compare_exchange(&self, prev: UnpackedState, next: UnpackedState) -> bool {
+        let prev_packed = prev.into();
+        let next_packed = next.into();
+
+        self.inner
+            .compare_exchange(
+                prev_packed,
+                next_packed,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    fn store_zero(&self) {
+        // this is only called on reinit/init, so lets use even stricter SeqCst
+        self.inner.store(0, Ordering::SeqCst)
+    }
+
+    fn dec(&self) -> Result<UnpackedState, io::Error> {
+        let new_state: PackedState = self.inner.fetch_add(!0, Ordering::Release) - 1;
+
+        new_state.try_into()
     }
 }
 
@@ -78,10 +110,10 @@ struct UnpackedState {
 }
 
 impl UnpackedState {
-    fn new(mut time_diff_micros: u64, mut tokens: i32) -> Self {
-        if time_diff_micros < 0 {
-            time_diff_micros = 0
-        }
+    fn new(mut time_diff: Duration, mut tokens: i32) -> Self {
+        // TODO: as_micros returns a u128 -- will the compiler do reasonable things here to elide that?
+        let time_diff_micros = time_diff.as_micros() as u64;
+
         if tokens < 0 {
             tokens = 0
         }
@@ -156,8 +188,16 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    pub fn new(rate: Limit, burst: u32) -> Limiter {
+    pub fn new(mut rate: Limit, mut burst: u32) -> Limiter {
         let now = Instant::now();
+
+        if rate < 0.0 {
+            rate = 0.0;
+        }
+
+        if burst > MAX_TOKENS as u32 {
+            burst = MAX_TOKENS as u32;
+        }
 
         let lim = Limiter {
             limit: rate,
@@ -177,7 +217,14 @@ impl Limiter {
         let l = self.reinit_mu.lock().unwrap();
 
         if let Err(_) = self.state.load() {
-            // store new packed state
+            // poison the state: try to get other threads we are racing with to call reinit
+            self.state.store_zero();
+
+            let new_state = UnpackedState::new(
+                now.duration_since(self.base),
+                self.burst.load(Ordering::SeqCst) as i32,
+            );
+            self.state.store(new_state);
         }
     }
 
@@ -192,32 +239,104 @@ impl Limiter {
     fn reserve_n(&self, now: Instant, n: NonZeroU32) -> bool {
         let n = n.get() as u64;
 
-        // let mut inner = self.inner.lock().unwrap();
-        //
-        // if inner.limit == INF {
-        //     return true;
-        // } else if inner.limit == 0.0 {
-        //     let mut ok = false;
-        //     if inner.burst >= n {
-        //         inner.burst -= n;
-        //         ok = true;
-        //     }
-        //     return ok;
-        // }
-        //
-        // let (last, mut tokens) = inner.advance(now);
-        // if tokens < (n as f64) {
-        //     if last != inner.last {
-        //         inner.last = last;
-        //     }
-        //     return false;
-        // }
-        //
-        // tokens -= n as f64;
-        //
-        // inner.last = now;
-        // inner.tokens = tokens;
+        if self.limit == INF {
+            return true;
+        } else if self.limit == 0.0 {
+            let mut ok = false;
+            if self.burst.load(Ordering::Acquire) >= n as i64 {
+                let prev_burst = self.burst.fetch_sub(n as i64, Ordering::Release);
+                ok = (prev_burst - n as i64) >= 0;
+            }
+            return ok;
+        }
 
+        let now_micros = now.duration_since(self.base).as_micros() as u64;
+
+        let limit = self.limit;
+        let max_burst = self.burst.load(Ordering::SeqCst);
+
+        for i in 0..MAX_TRIES {
+            // atomically load the state once, then unpack it
+            let curr_state = self.state.load();
+            let Ok(curr_state) = curr_state else {
+                self.reinit(now);
+                continue;
+            };
+
+            let last = self.base + Duration::from_micros(curr_state.time_diff_micros);
+            let last_updated_micros = curr_state.time_diff_micros;
+
+            // CPUs are fast, so "binning" time to microseconds (1,000 nanoseconds,
+            // 1/1,000 of a millisecond) leaves us with a pretty coarse-grained measure
+            // of advancing time that looks more like a staircase than a sloped hill.
+            // As traffic governed by this rate limiter goes up, this condition will be
+            // true a higher percentage of the time, reducing contention and trips through
+            // the outer loop.  Additionally, after the first iteration if this loop we
+            // also expect the likelihood of hitting this condition to increase.
+            if now_micros == last_updated_micros {
+                return if curr_state.tokens <= 0 {
+                    // fail early to scale "obviously rate limited" traffic.  Under load this
+                    // is the main branch taken and happens in the first iteration of the loop.
+                    false
+                } else {
+                    // there are tokens, and we're in the same epoch as currState.  race-ily
+                    // decrement the state and check if we won the race.  Because we treat
+                    // token count as a signed integer and always set an extra `1` bit just
+                    // to the left of token count, if we drop below 0 tokens here when racing
+                    // it is fine.
+                    //
+                    // This branch is mostly hit if we have burst capacity and a bunch of
+                    // concurrent requests coming in at once.
+                    if let Ok(new_state) = self.state.dec() {
+                        // if write tokens is 0, it means that our write was the one that
+                        // decremented tokens from 1 to 0.  We count that as a win!
+                        new_state.tokens >= 0
+                    } else {
+                        false
+                    }
+                };
+            }
+
+            let (new_now, mut tokens) = advance(
+                self.limit,
+                now,
+                last,
+                curr_state.tokens,
+                self.burst.load(Ordering::Relaxed) as u32,
+            );
+            if tokens < n as f64 {
+                // if there are no tokens available, return
+                return false;
+            }
+
+            // consume 1 token
+            let tokens = tokens - (n as f64);
+
+            let next_state = UnpackedState::new(new_now.duration_since(self.base), tokens as i32);
+
+            if self.state.compare_exchange(curr_state, next_state) {
+                // CAS worked (we won the race)
+                return true;
+            }
+
+            // CAS failed (someone else won the race), fallthrough.  That means
+            // with high probability lim.state's time epoch will be equal
+            // to our epoch in the next iteration, and we will fall into the first if
+            // statement next iteration.
+        }
+
+        // The above loop will normally execute 1-2 times before one of the return statements
+        // is triggered. To ensure we don't live-lock in some pathological case (for example,
+        // some NUMA system where different cores have significant clock drift) we limit the
+        // number of times the above loop executes.  If we _do_ hit that limit, it is because
+        // we failed over 200 times to update the state.  The only way that could happen is if
+        // (1) we tried and lost that CAS race each iteration (meaning another goroutine won
+        // and made progress) and (2) there are still tokens available (otherwise we would have
+        // exited early -- we don't attempt the CAS if it wouldn't result in us acquiring a
+        // token).  This feels like a fine compromise: we will return "true" here only in the
+        // case where there is _both_ a very high request rate on this limiter _and_ a very
+        // high rate limit set.  In testing, this has meant a limiter configured with limits
+        // greater than 5M RPS.
         true
     }
 
@@ -268,15 +387,20 @@ fn tokens_from_duration(limit: Limit, d: Duration) -> f64 {
 /// advance calculates and returns an updated state for lim resulting from the passage of time.
 fn advance(
     lim: Limit,
-    now: Instant,
+    mut now: Instant,
     mut last: Instant,
-    old_tokens: i32,
+    mut old_tokens: i32,
     burst: u32,
 ) -> (Instant, f64) {
-    // if there is a monotonicity bug, pull last backward
+    // in the event of a time jump _or_ another goroutine winning the CAS race,
+    // last may be in the future!
     if now < last {
         last = now;
     }
+
+    // we may observe a safe but race-y underflow from the non-CAS atomic
+    // decrement in the loop above, correct it here.
+    old_tokens = max(0, old_tokens);
 
     // Calculate the new number of tokens, due to time that passed.
     let elapsed = now.duration_since(last);
@@ -285,7 +409,25 @@ fn advance(
     if tokens > (burst as f64) {
         tokens = burst as f64;
     }
-    (last, tokens)
+
+    let whole_tokens = tokens as i32;
+
+    // if we don't adjust "now" we lose fractional tokens and rate limit
+    // at a substantially different rate than users specified.
+    let remaining = tokens - whole_tokens as f64;
+    let adjust = duration_from_tokens(lim, remaining);
+    // TODO: in theory this could underflow, but I don't think it will
+    //    in the absence of monotonic time bugs.  need to double check that.
+    let adjusted_now = now - adjust;
+
+    // this should always be true, but just in case ensure that the time
+    // tracked in lim.state doesn't go backwards.  An always-taken branch
+    // is ~ free.
+    if adjusted_now >= last {
+        now = adjusted_now;
+    }
+
+    (now, tokens)
 }
 
 #[cfg(test)]
