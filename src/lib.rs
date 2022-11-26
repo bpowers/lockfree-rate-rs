@@ -80,12 +80,7 @@ impl PackedStateCell {
         let next_packed = next.into();
 
         self.inner
-            .compare_exchange(
-                prev_packed,
-                next_packed,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
+            .compare_exchange(prev_packed, next_packed, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
@@ -94,8 +89,9 @@ impl PackedStateCell {
         self.inner.store(0, Ordering::SeqCst)
     }
 
-    fn dec(&self) -> Result<UnpackedState, io::Error> {
-        let new_state: PackedState = self.inner.fetch_add(!0, Ordering::SeqCst) - 1;
+    fn dec(&self, n: u64) -> Result<UnpackedState, io::Error> {
+        let v = 0u64.wrapping_sub(n); // this underflows on purpose
+        let new_state: PackedState = self.inner.fetch_add(v, Ordering::SeqCst) - n;
 
         new_state.try_into()
     }
@@ -188,9 +184,11 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    pub fn new(mut rate: Limit, mut burst: u32) -> Limiter {
-        let now = Instant::now();
+    pub fn new(rate: Limit, burst: u32) -> Limiter {
+        Self::new_at(rate, burst, Instant::now())
+    }
 
+    fn new_at(mut rate: Limit, mut burst: u32, now: Instant) -> Self {
         if rate < 0.0 {
             rate = 0.0;
         }
@@ -274,7 +272,7 @@ impl Limiter {
             // the outer loop.  Additionally, after the first iteration if this loop we
             // also expect the likelihood of hitting this condition to increase.
             if now_micros == last_updated_micros {
-                return if curr_state.tokens <= 0 {
+                return if curr_state.tokens < (n as i32) {
                     // fail early to scale "obviously rate limited" traffic.  Under load this
                     // is the main branch taken and happens in the first iteration of the loop.
                     false
@@ -287,7 +285,7 @@ impl Limiter {
                     //
                     // This branch is mostly hit if we have burst capacity and a bunch of
                     // concurrent requests coming in at once.
-                    if let Ok(new_state) = self.state.dec() {
+                    if let Ok(new_state) = self.state.dec(n) {
                         // if write tokens is 0, it means that our write was the one that
                         // decremented tokens from 1 to 0.  We count that as a win!
                         new_state.tokens >= 0
@@ -358,10 +356,20 @@ impl Limiter {
     }
 
     pub fn tokens_at(&self, now: Instant) -> f64 {
-        // let inner = self.inner.lock().unwrap();
-        // let (_, toks) = inner.advance(now);
-        // toks
-        0.0
+        let Ok(state) = self.state.load() else {
+            return 0.0;
+        };
+
+        let last = self.base + Duration::from_micros(state.time_diff_micros);
+        let (_, toks) = advance(
+            self.limit,
+            now,
+            last,
+            state.tokens,
+            self.burst.load(Ordering::SeqCst) as u32,
+        );
+
+        toks
     }
 }
 
@@ -414,7 +422,7 @@ fn advance(
 
     // if we don't adjust "now" we lose fractional tokens and rate limit
     // at a substantially different rate than users specified.
-    let remaining = tokens - whole_tokens as f64;
+    let remaining = tokens - (whole_tokens as f64);
     let adjust = duration_from_tokens(lim, remaining);
     // TODO: in theory this could underflow, but I don't think it will
     //    in the absence of monotonic time bugs.  need to double check that.
@@ -568,7 +576,7 @@ fn req(t: Instant, toks: f64, n: u32, ok: bool) -> Allow {
 #[test]
 fn test_limiter_burst_1() {
     run(
-        &Limiter::new(10.0, 1),
+        &Limiter::new_at(10.0, 1, T.t0),
         &vec![
             req(T.t0, 1., 1, true),
             req(T.t0, 0., 1, false),
@@ -586,7 +594,7 @@ fn test_limiter_burst_1() {
 #[test]
 fn test_limiter_burst_3() {
     run(
-        &Limiter::new(10.0, 3),
+        &Limiter::new_at(10.0, 3, T.t0),
         &vec![
             req(T.t0, 3., 2, true),
             req(T.t0, 1., 2, false),
@@ -608,7 +616,7 @@ fn test_limiter_burst_3() {
 #[test]
 fn test_limiter_burst_jump_backwards() {
     run(
-        &Limiter::new(10.0, 3),
+        &Limiter::new_at(10.0, 3, T.t0),
         &vec![
             req(T.t1, 3., 1, true), // start at t1
             req(T.t0, 2., 1, true), // jump back to t0, two tokens remain
