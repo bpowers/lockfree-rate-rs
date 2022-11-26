@@ -64,7 +64,7 @@ struct PackedStateCell {
 
 impl PackedStateCell {
     fn load(&self) -> Result<UnpackedState, io::Error> {
-        let state: PackedState = self.inner.load(Ordering::SeqCst);
+        let state: PackedState = self.inner.load(Ordering::Acquire);
 
         state.try_into()
     }
@@ -72,15 +72,17 @@ impl PackedStateCell {
     fn store(&self, state: UnpackedState) {
         let packed_state = state.into();
 
-        self.inner.store(packed_state, Ordering::SeqCst)
+        self.inner.store(packed_state, Ordering::Release)
     }
 
     fn compare_exchange(&self, prev: UnpackedState, next: UnpackedState) -> bool {
-        let prev_packed = prev.into();
-        let next_packed = next.into();
+        let prev = prev.into();
+        let next = next.into();
 
+        // Relaxed is OK for the failure, as on failure we will restart the loop in
+        // reserve_n and re-read this state.
         self.inner
-            .compare_exchange(prev_packed, next_packed, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
     }
 
@@ -91,7 +93,7 @@ impl PackedStateCell {
 
     fn dec(&self, n: u64) -> Result<UnpackedState, io::Error> {
         let v = 0u64.wrapping_sub(n); // this underflows on purpose
-        let new_state: PackedState = self.inner.fetch_add(v, Ordering::SeqCst) - n;
+        let new_state: PackedState = self.inner.fetch_add(v, Ordering::AcqRel) - n;
 
         new_state.try_into()
     }
@@ -106,7 +108,7 @@ struct UnpackedState {
 }
 
 impl UnpackedState {
-    fn new(mut time_diff: Duration, mut tokens: i32) -> Self {
+    fn new(time_diff: Duration, mut tokens: i32) -> Self {
         let time_diff_micros = time_diff.as_micros() as u64;
 
         if tokens < 0 {
@@ -120,6 +122,7 @@ impl UnpackedState {
     }
 }
 
+#[allow(clippy::from_over_into)]
 impl Into<PackedState> for UnpackedState {
     /// into packs a microsecond-resolution time duration along with a token
     /// count into a single 64-bit value.
@@ -157,21 +160,6 @@ impl TryFrom<PackedState> for UnpackedState {
             tokens,
         })
     }
-}
-
-// newPackedState packs a microsecond-resolution time duration along with a token
-// count into a single 32-bit value.
-fn new_packed_state(mut time_diff_micros: u64, mut tokens: i32) -> PackedState {
-    if time_diff_micros < 0 {
-        time_diff_micros = 0
-    }
-    if tokens < 0 {
-        tokens = 0
-    }
-    (time_diff_micros << TIME_SHIFT)
-        | (0x1 << SENTINEL_SHIFT)
-        | (0x1 << CATCH_UNDERFLOW_SHIFT)
-        | ((tokens as u64) & TOKENS_MASK)
 }
 
 pub struct Limiter {
@@ -213,14 +201,12 @@ impl Limiter {
         #[allow(unused)]
         let l = self.reinit_mu.lock().unwrap();
 
-        if let Err(_) = self.state.load() {
+        if self.state.load().is_err() {
+            let tokens = self.burst.load(Ordering::Relaxed) as i32;
             // poison the state: try to get other threads we are racing with to call reinit
             self.state.store_zero();
 
-            let new_state = UnpackedState::new(
-                now.duration_since(self.base),
-                self.burst.load(Ordering::SeqCst) as i32,
-            );
+            let new_state = UnpackedState::new(now.duration_since(self.base), tokens);
             self.state.store(new_state);
         }
     }
@@ -240,8 +226,8 @@ impl Limiter {
             return true;
         } else if self.limit == 0.0 {
             let mut ok = false;
-            if self.burst.load(Ordering::SeqCst) >= n as i64 {
-                let prev_burst = self.burst.fetch_sub(n as i64, Ordering::SeqCst);
+            if self.burst.load(Ordering::Acquire) >= n as i64 {
+                let prev_burst = self.burst.fetch_sub(n as i64, Ordering::Release);
                 ok = (prev_burst - n as i64) >= 0;
             }
             return ok;
@@ -250,14 +236,14 @@ impl Limiter {
         let now_micros = now.duration_since(self.base).as_micros() as u64;
 
         let limit = self.limit;
-        let max_burst = self.burst.load(Ordering::SeqCst);
+        let max_burst = self.burst.load(Ordering::Relaxed) as u32;
 
-        for i in 0..MAX_TRIES {
+        for _ in 0..MAX_TRIES {
             // atomically load the state once, then unpack it
             let curr_state = self.state.load();
             let Ok(curr_state) = curr_state else {
                 self.reinit(now);
-                continue;
+                continue
             };
 
             let last = self.base + Duration::from_micros(curr_state.time_diff_micros);
@@ -294,13 +280,7 @@ impl Limiter {
                 };
             }
 
-            let (new_now, mut tokens) = advance(
-                self.limit,
-                now,
-                last,
-                curr_state.tokens,
-                self.burst.load(Ordering::SeqCst) as u32,
-            );
+            let (new_now, tokens) = advance(limit, now, last, curr_state.tokens, max_burst);
             if tokens < n as f64 {
                 // if there are no tokens available, return
                 return false;
@@ -338,7 +318,8 @@ impl Limiter {
     }
 
     pub fn burst(&self) -> u64 {
-        let n = self.burst.load(Ordering::SeqCst);
+        // this is a reporting API, we only need atomic access not ordering constraints
+        let n = self.burst.load(Ordering::Relaxed);
         if n < 0 {
             0
         } else {
@@ -365,7 +346,7 @@ impl Limiter {
             now,
             last,
             state.tokens,
-            self.burst.load(Ordering::SeqCst) as u32,
+            self.burst.load(Ordering::Relaxed) as u32,
         );
 
         toks
@@ -523,6 +504,7 @@ struct Times {
     t2: Instant,
     t3: Instant,
     t4: Instant,
+    #[allow(unused)]
     t5: Instant,
     t9: Instant,
 }
