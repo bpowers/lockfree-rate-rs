@@ -107,7 +107,6 @@ struct UnpackedState {
 
 impl UnpackedState {
     fn new(mut time_diff: Duration, mut tokens: i32) -> Self {
-        // TODO: as_micros returns a u128 -- will the compiler do reasonable things here to elide that?
         let time_diff_micros = time_diff.as_micros() as u64;
 
         if tokens < 0 {
