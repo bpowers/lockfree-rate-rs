@@ -622,3 +622,19 @@ fn test_limiter_no_truncation_erors() {
     let l = Limiter::new(0.7692307692307693, 1);
     assert!(l.allow());
 }
+
+#[test]
+fn test_size_of_limiter() {
+    use std::mem::size_of;
+
+    // A sync::Arc is a pointer to an ArcInner<T>, which has the layout:
+    // strong: atomic::AtomicUsize,
+    // weak: atomic::AtomicUsize,
+    // v: T,
+
+    // we want the ArcInner<Limiter> to end up as 64-bytes wide to fit precisely
+    // in one cache line, avoiding false sharing.
+
+    let struct_size = size_of::<Limiter>();
+    assert_eq!(64 - 2 * 8, struct_size);
+}
